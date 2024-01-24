@@ -48,7 +48,7 @@ Put the next function into the **.bashrc** or a similar config:
 ```bash
 walk () {
 	# export WALK_EDITOR=nano
-  # export WALK_MODE=1 # for using detail
+	# export WALK_MODE=1 # for using detail
 	local result=$(command walk "$@")
 	[ -n "$result" ] && cd -- "$result"
 }
