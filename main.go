@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	. "strings"
 	"syscall"
 	"text/tabwriter"
@@ -166,6 +165,11 @@ type (
 )
 
 func (m *model) Init() tea.Cmd {
+	walkMode, err := strconv.Atoi(lookup([]string{"WALK_MODE"}, "0"))
+	if err == nil && walkMode < int(navigationModeMax) {
+		m.navMode = navigationMode(walkMode)
+	}
+
 	return nil
 }
 
@@ -851,7 +855,7 @@ func padRight(s string, n int) string {
 		return s
 	}
 
-	return s + strings.Repeat(" ", n-len(s))
+	return s + Repeat(" ", n-len(s))
 }
 
 func padLeft(s string, n int) string {
@@ -861,7 +865,7 @@ func padLeft(s string, n int) string {
 		return s
 	}
 
-	return strings.Repeat(" ", n-len(s)) + s
+	return Repeat(" ", n-len(s)) + s
 }
 
 func formatSizeOf(value float64, suffix string, factor float64) string {
