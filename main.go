@@ -98,7 +98,13 @@ func main() {
 		}
 	}
 
-	output := termenv.NewOutput(os.Stderr)
+	var output *termenv.Output
+	if termenv.EnvNoColor() {
+		output = termenv.NewOutput(os.Stderr)
+	} else {
+		output = termenv.NewOutput(os.Stderr, termenv.WithProfile(termenv.ANSI256))
+	}
+
 	lipgloss.SetColorProfile(output.ColorProfile())
 
 	m := &model{
