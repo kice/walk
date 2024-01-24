@@ -6,10 +6,14 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	. "strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
@@ -39,6 +43,7 @@ var (
 
 var (
 	keyForceQuit = key.NewBinding(key.WithKeys("ctrl+c"))
+	keyCDQuit    = key.NewBinding(key.WithKeys("shift+enter"))
 	keyQuit      = key.NewBinding(key.WithKeys("esc"))
 	keyQuitQ     = key.NewBinding(key.WithKeys("q"))
 	keyOpen      = key.NewBinding(key.WithKeys("enter"))
@@ -66,6 +71,8 @@ var (
 	keyDelete    = key.NewBinding(key.WithKeys("d"))
 	keyUndo      = key.NewBinding(key.WithKeys("u"))
 	keyYank      = key.NewBinding(key.WithKeys("y"))
+	keyMode      = key.NewBinding(key.WithKeys("m"))
+	keyShowRaw   = key.NewBinding(key.WithKeys("v"))
 )
 
 func main() {
@@ -110,6 +117,14 @@ func main() {
 	os.Exit(m.exitCode)
 }
 
+type navigationMode int
+
+const (
+	navigationModeDefault navigationMode = iota
+	navigationModeDetail
+	navigationModeMax
+)
+
 type model struct {
 	path              string              // Current dir path we are looking at.
 	files             []fs.DirEntry       // Files we are looking at.
@@ -131,6 +146,8 @@ type model struct {
 	deleteCurrentFile bool                // Whether to delete current file.
 	toBeDeleted       []toDelete          // Map of files to be deleted.
 	yankSuccess       bool                // Show yank info
+	navMode           navigationMode      // current navigationMode
+	showRawValue      bool                // Show raw value
 }
 
 type position struct {
@@ -212,6 +229,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case key.Matches(msg, keyQuit, keyQuitQ):
+			_, _ = fmt.Fprintln(os.Stderr) // Keep last item visible after prompt.
+			quitNoCd := ToLower(lookup([]string{"WALK_QUIT_NO_CD"}, ""))
+			if quitNoCd != "1" && quitNoCd != "true" && quitNoCd != "yes" {
+				fmt.Println(m.path) // Write to cd.
+			}
+			m.exitCode = 0
+			m.performPendingDeletions()
+			return m, tea.Quit
+
+		case key.Matches(msg, keyCDQuit):
 			_, _ = fmt.Fprintln(os.Stderr) // Keep last item visible after prompt.
 			fmt.Println(m.path)            // Write to cd.
 			m.exitCode = 0
@@ -363,6 +390,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			clipboard.WriteAll(m.path)
 			m.yankSuccess = true
 			return m, nil
+		case key.Matches(msg, keyMode):
+			// TODO: convert current file pointer
+			m.navMode = m.navMode + 1
+			if m.navMode >= navigationModeMax {
+				m.navMode = navigationModeDefault
+			}
+		case key.Matches(msg, keyShowRaw):
+			m.showRawValue = !m.showRawValue
 		} // End of switch statement for key presses.
 
 		m.deleteCurrentFile = false
@@ -395,6 +430,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) BuildDefaultView() string {
+	var main string
+	return main
+}
+
 func (m *model) View() string {
 	width := m.width
 	if m.previewMode {
@@ -403,12 +443,21 @@ func (m *model) View() string {
 	height := m.listHeight()
 
 	var names [][]string
-	names, m.rows, m.columns = wrap(m.files, width, height, func(name string, i, j int) {
-		if m.findPrevName && m.prevName == name {
-			m.c = i
-			m.r = j
-		}
-	})
+	if m.navMode == navigationModeDetail {
+		names, m.rows, m.columns = buildDetailFileList(m.showRawValue, m.files, width, height, func(name string, i, j int) {
+			if m.findPrevName && m.prevName == name {
+				m.c = i
+				m.r = j
+			}
+		})
+	} else { // navigationModeDetailDefault
+		names, m.rows, m.columns = buildFilesList(m.files, width, height, func(name string, i, j int) {
+			if m.findPrevName && m.prevName == name {
+				m.c = i
+				m.r = j
+			}
+		})
+	}
 
 	// If we need to select previous directory on "up".
 	if m.findPrevName {
@@ -496,7 +545,7 @@ func (m *model) View() string {
 	// Delete bar.
 	if len(m.toBeDeleted) > 0 {
 		toDelete := m.toBeDeleted[len(m.toBeDeleted)-1]
-		timeLeft := int(toDelete.at.Sub(time.Now()).Seconds())
+		timeLeft := int(time.Until(toDelete.at).Seconds())
 		deleteBar := fmt.Sprintf("%v deleted. (u)ndo %v", path.Base(toDelete.path), timeLeft)
 		main += "\n" + danger.Render(deleteBar)
 	}
@@ -715,7 +764,13 @@ func (m *model) preview() {
 			m.previewContent = err.Error()
 		}
 
-		names, rows, columns := wrap(files, width, height, nil)
+		var names [][]string
+		var rows, columns int
+		if m.navMode == navigationModeDetail {
+			names, rows, columns = buildDetailFileList(m.showRawValue, files, width, height, nil)
+		} else {
+			names, rows, columns = buildFilesList(files, width, height, nil)
+		}
 
 		output := make([]string, rows)
 		for j := 0; j < rows; j++ {
@@ -789,7 +844,189 @@ func leaveOnlyAscii(content []byte) string {
 	return string(result)
 }
 
-func wrap(files []os.DirEntry, width int, height int, callback func(name string, i, j int)) ([][]string, int, int) {
+func padRight(s string, n int) string {
+	if n == 0 || len(s) == n {
+		return s
+	} else if n < len(s) {
+		return s
+	}
+
+	return s + strings.Repeat(" ", n-len(s))
+}
+
+func padLeft(s string, n int) string {
+	if n == 0 || len(s) == n {
+		return s
+	} else if n < len(s) {
+		return s
+	}
+
+	return strings.Repeat(" ", n-len(s)) + s
+}
+
+func formatSizeOf(value float64, suffix string, factor float64) string {
+	isIntegral := value == float64(int64(value))
+	if isIntegral && math.Abs(value) < 999.5 {
+		return fmt.Sprintf("%d%s", int64(value), suffix)
+	}
+
+	unit := []string{"", "k", "M", "G", "T", "P", "E", "Z"}
+	for _, u := range unit {
+		if math.Abs(value) < 999.5 {
+			if math.Abs(value) < 99.95 {
+				if math.Abs(value) < 9.995 {
+					return fmt.Sprintf("%1.2f%s%s", value, u, suffix)
+				}
+				return fmt.Sprintf("%2.1f%s%s", value, u, suffix)
+			}
+			return fmt.Sprintf("%3.0f%s%s", value, u, suffix)
+		}
+		value = value / factor
+	}
+	return fmt.Sprintf("%3.1fY%s", value, suffix)
+}
+
+func buildDetailFileList(showRaw bool, files []os.DirEntry, width int, height int, callback func(name string, i, j int)) ([][]string, int, int) {
+	names := make([]string, len(files))
+
+	// should use different format on Windows
+
+	uidLen := 0
+	gidLen := 0
+	sizeLen := 0
+
+	userNames := map[uint32]string{}
+	groupNames := map[uint32]string{}
+
+	errorName := "<ERROR>"
+
+	for n := 0; n < len(files); n++ {
+		info, err := files[n].Info()
+		if err != nil {
+			continue
+		}
+
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			if _, ok := userNames[stat.Uid]; !ok {
+				uid := strconv.FormatUint(uint64(stat.Uid), 10)
+				if showRaw {
+					uidLen = max(uidLen, len(uid))
+					userNames[stat.Uid] = uid
+				} else {
+					u, err := user.LookupId(uid)
+					if err == nil {
+						uidLen = max(uidLen, len(u.Username))
+						userNames[stat.Uid] = u.Username
+					} else {
+						uidLen = max(uidLen, len(errorName))
+						userNames[stat.Uid] = errorName
+					}
+				}
+			}
+
+			if _, ok := groupNames[stat.Gid]; !ok {
+				gid := strconv.FormatUint(uint64(stat.Gid), 10)
+				if showRaw {
+					gidLen = max(gidLen, len(gid))
+					groupNames[stat.Gid] = gid
+				} else {
+					g, err := user.LookupGroupId(gid)
+					if err == nil {
+						gidLen = max(gidLen, len(g.Name))
+						groupNames[stat.Gid] = g.Name
+					} else {
+						gidLen = max(gidLen, len(errorName))
+						groupNames[stat.Gid] = errorName
+					}
+				}
+			}
+		}
+
+		if showRaw {
+			sizeStr := strconv.FormatInt(info.Size(), 10)
+			sizeLen = max(sizeLen, len(sizeStr))
+		} else {
+			sizeStr := formatSizeOf(float64(info.Size()), "B", 1024)
+			sizeLen = max(sizeLen, len(sizeStr))
+		}
+	}
+
+	nameLen := 0
+	for i := 0; i < len(files); i++ {
+		info, err := files[i].Info()
+		if err != nil {
+			names[i] = fmt.Sprintf("[ERR] %s", files[i].Name())
+			continue
+		}
+
+		cols := make([]string, 0, 5)
+
+		mode := info.Mode()
+		if showRaw {
+			// x0777
+			cols = append(cols, fmt.Sprintf("%s 0%03o", mode.String()[:1], mode.Perm()))
+		} else {
+			// drwxr-xr-x
+			cols = append(cols, mode.String())
+		}
+
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			cols = append(
+				cols,
+				fmt.Sprintf("%3d", stat.Nlink),
+				padRight(userNames[stat.Uid], uidLen),
+				padRight(groupNames[stat.Gid], gidLen),
+			)
+		}
+
+		if showRaw {
+			cols = append(cols, padLeft(strconv.FormatInt(info.Size(), 10), sizeLen))
+		} else {
+			cols = append(cols, padLeft(formatSizeOf(float64(info.Size()), "B", 1024), sizeLen))
+		}
+
+		if showRaw {
+			cols = append(cols, strconv.FormatInt(info.ModTime().Unix(), 10))
+		} else {
+			cols = append(cols, info.ModTime().Format(time.DateTime))
+		}
+
+		name := ""
+		if showIcons {
+			if err == nil {
+				icon := icons.getIcon(info)
+				if icon != "" {
+					name += icon + " "
+				}
+			}
+		}
+
+		name += info.Name()
+		if callback != nil {
+			callback(files[i].Name(), 0, i)
+		}
+
+		if files[i].IsDir() {
+			// Dirs should have a slash at the end.
+			name += fileSeparator
+		}
+
+		cols = append(cols, name)
+
+		row := Join(cols, " ")
+		nameLen = max(nameLen, len(row))
+
+		names[i] = row
+	}
+
+	for i := 0; i < len(names); i++ {
+		names[i] += Repeat(" ", nameLen-len(names[i]))
+	}
+
+	return [][]string{names}, len(files), 1
+}
+
+func buildFilesList(files []os.DirEntry, width int, height int, callback func(name string, i, j int)) ([][]string, int, int) {
 	// If it's possible to fit all files in one column on a third of the screen,
 	// just use one column. Otherwise, let's squeeze listing in half of screen.
 	columns := len(files) / (height / 3)
