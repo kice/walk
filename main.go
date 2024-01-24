@@ -102,6 +102,8 @@ func main() {
 	if termenv.EnvNoColor() {
 		output = termenv.NewOutput(os.Stderr)
 	} else {
+		// in case env not define
+		os.Setenv("COLORTERM", "true")
 		output = termenv.NewOutput(os.Stderr, termenv.WithProfile(termenv.ANSI256))
 	}
 
